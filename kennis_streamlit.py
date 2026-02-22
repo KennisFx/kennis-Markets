@@ -183,6 +183,7 @@ net = float(live_feat["net"])
 
 # Posterior sampling + predicción (defensiva) + calibración contra sesgo histórico
 sample_probs_adj = None
+calibration_applied = False
 try:
     cov_post = np.array(cov_post)
     cov_post = 0.5 * (cov_post + cov_post.T)
@@ -238,6 +239,112 @@ if np.sum(np.abs(contrib_raw)) > 0:
 else:
     contrib_pct = np.zeros_like(contrib_raw)
 
+# ------------------ Módulo Intradía (Híbrido Profesional) ------------------
+st.markdown("---")
+st.markdown("## Intraday Execution Engine")
+
+activate_intraday = st.checkbox("Activar módulo intradía (requiere bias macro activo)")
+
+if activate_intraday:
+    # Solo permitir intradía si bias macro activo y convicción suficiente
+    if decision_flag == "wait" or conviction < 35:
+        st.warning("Bias macro insuficiente o convicción baja. Intradía desactivado hasta nueva señal.")
+        intraday_signal = "NO TRADE"
+        intraday_info = {}
+    else:
+        # Parámetros de la demo (reemplazar por feed real en producción)
+        st.markdown("### Parámetros intradía (demo)")
+        # Simulación de datos intradía (1m-like series) — sustituir por feed real
+        np.random.seed(7)
+        M = 300
+        intraday_returns = np.random.normal(0, 0.0008, M)  # retornos pequeños
+        intraday_prices = 100.0 + np.cumsum(intraday_returns)
+        intraday_volume = np.random.randint(80, 200, M)
+
+        df_intraday = pd.DataFrame({
+            "price": intraday_prices,
+            "volume": intraday_volume
+        })
+
+        # VWAP
+        df_intraday["cum_vol"] = df_intraday["volume"].cumsum()
+        df_intraday["cum_pv"] = (df_intraday["price"] * df_intraday["volume"]).cumsum()
+        # evitar división por cero
+        df_intraday["vwap"] = df_intraday["cum_pv"] / df_intraday["cum_vol"].replace(0, np.nan)
+        df_intraday["vwap"].fillna(method="ffill", inplace=True)
+        current_price = float(df_intraday["price"].iloc[-1])
+        current_vwap = float(df_intraday["vwap"].iloc[-1])
+
+        # ATR proxy (rolling mean absolute diff)
+        df_intraday["returns_abs"] = df_intraday["price"].diff().abs()
+        atr = float(df_intraday["returns_abs"].rolling(14, min_periods=1).mean().iloc[-1])
+
+        # Session high / low
+        session_high = float(df_intraday["price"].max())
+        session_low = float(df_intraday["price"].min())
+
+        # Tick imbalance proxy
+        up_ticks = int((df_intraday["price"].diff() > 0).sum())
+        down_ticks = int((df_intraday["price"].diff() < 0).sum())
+        denom = max(1, up_ticks + down_ticks)
+        imbalance = float((up_ticks - down_ticks) / denom)
+
+        # Confirmación estructural simple
+        intraday_signal = "NO TRADE"
+        if decision_flag == "buy":
+            # criterio: precio por encima de VWAP y imbalance positivo
+            if (current_price > current_vwap) and (imbalance > 0):
+                intraday_signal = "LONG CONFIRMADO"
+        elif decision_flag == "sell":
+            if (current_price < current_vwap) and (imbalance < 0):
+                intraday_signal = "SHORT CONFIRMADO"
+
+        intraday_info = {
+            "current_price": current_price,
+            "current_vwap": current_vwap,
+            "atr": atr,
+            "session_high": session_high,
+            "session_low": session_low,
+            "imbalance": imbalance,
+            "signal": intraday_signal
+        }
+
+        # Mostrar resultados intradía
+        st.markdown("### Estado intradía (demo)")
+        colA, colB, colC = st.columns(3)
+        with colA:
+            st.metric("Precio actual", f"{current_price:.5f}")
+            st.metric("VWAP", f"{current_vwap:.5f}")
+        with colB:
+            st.metric("ATR (proxy)", f"{atr:.6f}")
+            st.metric("Imbalance", f"{imbalance:.3f}")
+        with colC:
+            st.metric("Session High", f"{session_high:.5f}")
+            st.metric("Session Low", f"{session_low:.5f}")
+
+        if intraday_signal == "LONG CONFIRMADO":
+            st.success("Señal Intradía: LONG confirmado con VWAP + Imbalance")
+        elif intraday_signal == "SHORT CONFIRMADO":
+            st.error("Señal Intradía: SHORT confirmado con VWAP + Imbalance")
+        else:
+            st.info("No hay confirmación intradía aún. Esperar estructura o mayor desequilibrio.")
+
+        # Plan de ejecución sugerido (demo)
+        st.markdown("### Plan de Ejecución (demo)")
+        if intraday_signal in ["LONG CONFIRMADO", "SHORT CONFIRMADO"]:
+            st.markdown(f"""
+            - Entrada en dirección del bias macro ({decision}).
+            - Stop técnico ≈ 1.2 × ATR (≈ {1.2*atr:.6f}).
+            - Target inicial ≥ 1.5 × riesgo.
+            - Tamaño sugerido: 0.5–1% del capital.
+            """)
+        else:
+            st.markdown("Esperar ruptura estructural o mayor desequilibrio de flujo.")
+
+else:
+    intraday_signal = "NO TRADE"
+    intraday_info = {}
+
 # ------------------ Narrativa simplificada + técnica (en español) ------------------
 def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par, calibration_applied, using_demo):
     """
@@ -264,9 +371,9 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
         )
 
     # Texto técnico
-    fed_s = x_live[3]
-    cot_s = x_live[0]
-    retail_s = x_live[4]
+    fed_s = x_live[3] if len(x_live) > 3 else 0.0
+    cot_s = x_live[0] if len(x_live) > 0 else 0.0
+    retail_s = x_live[4] if len(x_live) > 4 else 0.0
 
     tech_lines = []
     tech_lines.append(f"Resumen técnico — activo: {par}")
@@ -386,7 +493,8 @@ out_df = pd.DataFrame([{
     "par": par, "cot_long": cot_long, "cot_short": cot_short, "net": net,
     "fed_prob": fed_prob, "retail_pct": retail_pct,
     "p_mean": p_mean, "p_2.5": p_low, "p_97.5": p_high,
-    "conviction": conviction, "decision": decision
+    "conviction": conviction, "decision": decision,
+    "intraday_signal": intraday_signal
 }])
 
 try:
