@@ -19,6 +19,7 @@ st.markdown(
       .explain { color:#22303a; font-size:14px; line-height:1.45; }
       .small { font-size:12px; color:#6f8190; }
       hr { border:none; border-top: 1px solid #e6eef8; }
+      .warning { color:#8a6d3b; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -90,7 +91,6 @@ def fit_bayesian_logit(X, y, prior_var=0.5, maxiter=200, tol=1e-8):
         beta = beta + delta
         if np.linalg.norm(delta) < tol:
             break
-    # final H may be singular in degenerate data; add jitter defensivo
     try:
         cov = np.linalg.inv(H)
     except np.linalg.LinAlgError:
@@ -104,6 +104,7 @@ def to_excel_bytes(df):
     return out.getvalue()
 
 # ------------------ Ingesta de datos ------------------
+using_demo = False
 if uploaded is not None:
     try:
         df = pd.read_csv(uploaded)
@@ -111,8 +112,9 @@ if uploaded is not None:
     except Exception as e:
         st.error("Error leyendo CSV: " + str(e))
         df = pd.DataFrame()
+        using_demo = True
 else:
-    # demo sintético (multi-par no real) — solo para UI y pruebas
+    using_demo = True
     np.random.seed(42)
     N = 420
     cot_long_demo = np.random.normal(12000, 3000, size=N).astype(int)
@@ -156,9 +158,10 @@ if "target_up" in df_feat.columns:
     X_train = train_df[feature_cols].fillna(0).values
     y_train = train_df["target_up"].astype(int).values
 else:
+    # Should not happen because demo includes target_up, but keep safe fallback
     train_df = df_feat.copy()
     X_train = train_df[feature_cols].fillna(0).values
-    y_train = train_df["target_up"].astype(int).values
+    y_train = df_feat.get("target_up", pd.Series(np.zeros(len(train_df)))).astype(int).values
 
 if retrain and uploaded is None:
     st.warning("Para reentrenar debe subir un CSV histórico con etiqueta 'target_up'.")
@@ -178,30 +181,47 @@ live_feat = build_features(aug, s_cot_local=s_cot).iloc[-1]
 x_live = live_feat[feature_cols].fillna(0).values
 net = float(live_feat["net"])
 
-# Posterior sampling + predicción (defensiva)
+# Posterior sampling + predicción (defensiva) + calibración contra sesgo histórico
+sample_probs_adj = None
 try:
-    # ensure cov_post is symmetric PSD (small jitter)
     cov_post = np.array(cov_post)
     cov_post = 0.5 * (cov_post + cov_post.T)
     jitter = 1e-8 * np.eye(cov_post.shape[0])
     samples = np.random.multivariate_normal(beta_map, cov_post + jitter, size=4000)
     sample_probs = sigmoid(samples.dot(x_live))
-    p_mean = float(sample_probs.mean())
-    p_low = float(np.percentile(sample_probs, 2.5))
-    p_high = float(np.percentile(sample_probs, 97.5))
+
+    # Calibración: centramos la predicción para neutralizar el sesgo medio en entrenamiento
+    try:
+        train_eta = X_train.dot(beta_map)
+        train_mean_p = float(sigmoid(train_eta).mean())
+    except Exception:
+        train_mean_p = float(sigmoid(X_train.dot(beta_map)).mean()) if X_train.size else 0.5
+
+    bias_offset = train_mean_p - 0.5  # positivo => modelo históricamente overpredicts up
+    # ajustar sample probs y recortar entre 0 y 1
+    sample_probs_adj = np.clip(sample_probs - bias_offset, 0.0, 1.0)
+
+    p_mean = float(sample_probs_adj.mean())
+    p_low = float(np.percentile(sample_probs_adj, 2.5))
+    p_high = float(np.percentile(sample_probs_adj, 97.5))
+    calibration_applied = abs(bias_offset) > 1e-6
 except Exception:
     eta = float(x_live.dot(beta_map))
     p_mean = float(sigmoid(eta))
     p_low, p_high = p_mean, p_mean
-    sample_probs = np.array([p_mean])
+    sample_probs_adj = np.array([p_mean])
+    calibration_applied = False
 
-# Índice de convicción
-dispersion = max(1e-9, float(np.std(sample_probs)))
+# Índice de convicción (usando distribución calibrada si existe)
+dispersion = max(1e-9, float(np.std(sample_probs_adj)))
 conviction = min(100.0, max(0.0, 100.0 * (abs(p_mean - 0.5) * 2.0) * (1.0 / (1.0 + 5.0 * dispersion))))
 conviction = round(conviction, 1)
 
-# Decisión táctica
-if p_mean >= 0.60:
+# Decisión táctica profesional (probabilidad + convicción)
+if conviction < 35:
+    decision = "ESPERAR (NO OPERAR)"
+    decision_flag = "wait"
+elif p_mean >= 0.60:
     decision = "COMPRAR (LONG)"
     decision_flag = "buy"
 elif p_mean <= 0.40:
@@ -219,12 +239,11 @@ else:
     contrib_pct = np.zeros_like(contrib_raw)
 
 # ------------------ Narrativa simplificada + técnica (en español) ------------------
-def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par):
+def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par, calibration_applied, using_demo):
     """
     Versión legible para usuario promedio + explicación técnica desplegable.
     Devuelve (texto_simple, texto_tecnico).
     """
-    # Frases simples y directas
     prob_text = f"P({par} ↑) ≈ {p_mean*100:.1f}% (IC95%: {p_low*100:.1f}%–{p_high*100:.1f}%). Convicción: {conviction}/100."
     if decision_flag == "buy":
         simple = (
@@ -241,10 +260,10 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
     else:
         simple = (
             "Recomendación: **No operar (esperar)**.\n\n"
-            "Por qué (simple): la probabilidad está cerca de equilibrio y la incertidumbre es elevada; mejor esperar confirmación."
+            "Por qué (simple): la probabilidad está cerca de equilibrio o la convicción es baja; mejor esperar confirmación."
         )
 
-    # Construimos el texto técnico (audit-friendly) — compacto
+    # Texto técnico
     fed_s = x_live[3]
     cot_s = x_live[0]
     retail_s = x_live[4]
@@ -252,6 +271,10 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
     tech_lines = []
     tech_lines.append(f"Resumen técnico — activo: {par}")
     tech_lines.append(f"- Probabilidad bayesiana P({par} ↑) = {p_mean*100:.1f}% (IC95%: {p_low*100:.1f}%–{p_high*100:.1f}%). Convicción: {conviction}/100.")
+    if calibration_applied:
+        tech_lines.append("- Nota técnica: la predicción ha sido calibrada contra el sesgo medio del histórico para mejorar neutralidad.")
+    if using_demo:
+        tech_lines.append("- Advertencia: se están usando datos demo para calibración. Suba su CSV histórico para calibración real y backtests.")
     # Macro
     if fed_s > 0.4:
         tech_lines.append("- Macro: FedWatch con sesgo hawkish → favorece USD fuerte en el corto plazo.")
@@ -273,14 +296,14 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
         tech_lines.append("- Retail: minoristas inclinados a vender — puede reforzar momentum bajista si lo institucional confirma.")
     else:
         tech_lines.append("- Retail: posicionamiento minorista balanceado — no prevalece contrarian ahora.")
-    # Contribuciones (compactas)
+    # Contribuciones
     tech_lines.append("- Descomposición de contribuciones (valores y % firmadas):")
     for name, pct, val in zip(feature_cols, contrib_pct, x_live):
         sign = "+" if pct >= 0 else "-"
         tech_lines.append(f"  • {name}: {sign}{abs(pct):.1f}%  (valor {val:.3f})")
-    # Razonamiento y ejecución
+    # Razonamiento
     if decision_flag == "buy":
-        tech_lines.append("- Recomendación táctica: acumulación gradual LONG. Ejecución: scale-in 3 tramos; tamaño inicial 0.5–1% notional; stop 1.0–1.5×ATR; R:R ≥ 1:1.5.")
+        tech_lines.append("- Recomendación táctica: acumulación gradual LONG. Ejecución: escala en 3 tramos; tamaño inicial 0.5–1% notional; stop 1.0–1.5×ATR; R:R ≥ 1:1.5.")
     elif decision_flag == "sell":
         tech_lines.append("- Recomendación táctica: considerar SHORT táctico o reducir largos. Ejecución: tamaño reducido; stops ajustados; vigilar noticias.")
     else:
@@ -293,7 +316,7 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
 
 # Obtener textos simple y técnico
 texto_simple, texto_tecnico = narrative_tactical_simplificada(
-    p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par
+    p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par, calibration_applied, using_demo
 )
 
 # ------------------ Interfaz: resultado y narrativa ------------------
@@ -306,6 +329,10 @@ with left:
         unsafe_allow_html=True
     )
     st.markdown(f"<div class='muted'>Convicción: <strong>{conviction}/100</strong></div>", unsafe_allow_html=True)
+    if calibration_applied:
+        st.markdown("<div class='small warning'>Se aplicó calibración contra el sesgo histórico del modelo para favorecer neutralidad.</div>", unsafe_allow_html=True)
+    if using_demo:
+        st.markdown("<div class='small warning'>ATENCIÓN: usando datos demo. Suba CSV histórico para calibración real.</div>", unsafe_allow_html=True)
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown("### Plan táctico (resumen)", unsafe_allow_html=True)
     if decision_flag == "buy":
