@@ -37,7 +37,10 @@ st.markdown("---")
 
 # ------------------ Sidebar: Inputs & opciones ------------------
 st.sidebar.header("Entradas (táctica / swing)")
-uploaded = st.sidebar.file_uploader("Sube CSV histórico (opcional). Columnas requeridas: date,cot_long,cot_short,fed_prob,retail_pct,target_up", type=["csv"])
+uploaded = st.sidebar.file_uploader(
+    "Sube CSV histórico (opcional). Columnas requeridas: date,cot_long,cot_short,fed_prob,retail_pct,target_up",
+    type=["csv"]
+)
 st.sidebar.markdown("O ingresa la fila live abajo:")
 
 par = st.sidebar.selectbox(
@@ -71,7 +74,7 @@ def fit_bayesian_logit(X, y, prior_var=0.5, maxiter=200, tol=1e-8):
     n, p = X.shape
     beta = np.zeros(p)
     prior_prec = np.eye(p) / prior_var
-    H = None
+    H = np.eye(p) * 1e-6
     for i in range(maxiter):
         eta = X.dot(beta)
         p_vec = sigmoid(eta)
@@ -87,12 +90,15 @@ def fit_bayesian_logit(X, y, prior_var=0.5, maxiter=200, tol=1e-8):
         beta = beta + delta
         if np.linalg.norm(delta) < tol:
             break
-    cov = np.linalg.inv(H)
+    # final H may be singular in degenerate data; add jitter defensivo
+    try:
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(H)
     return beta, cov
 
 def to_excel_bytes(df):
     out = BytesIO()
-    # pandas con openpyxl como engine — openpyxl debe estar en requirements.txt
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="signal")
     return out.getvalue()
@@ -114,8 +120,8 @@ else:
     fed_demo = np.clip(np.random.normal(60, 12, size=N), 0, 100)
     retail_demo = np.clip(np.random.normal(50, 12, size=N), 0, 100)
     net_demo = cot_long_demo - cot_short_demo
-    z_net_demo = (net_demo - net_demo.mean()) / (net_demo.std() if net_demo.std()>0 else 1)
-    true_score = 0.8*z_net_demo + 1.5*((fed_demo - 50)/50) - 0.5*((retail_demo - 50)/50)
+    z_net_demo = (net_demo - net_demo.mean()) / (net_demo.std() if net_demo.std() > 0 else 1)
+    true_score = 0.8 * z_net_demo + 1.5 * ((fed_demo - 50) / 50) - 0.5 * ((retail_demo - 50) / 50)
     prob_demo = sigmoid(true_score)
     target_demo = (np.random.rand(N) < prob_demo).astype(int)
     df = pd.DataFrame({
@@ -162,7 +168,6 @@ with st.spinner("Calibrando modelo bayesiano táctico (MAP + Laplace)..."):
         beta_map, cov_post = fit_bayesian_logit(X_train, y_train, prior_var=prior_var)
     except Exception as e:
         st.error("Fallo en calibración del modelo: " + str(e))
-        # fallback: coeficientes neutros
         beta_map = np.zeros(len(feature_cols))
         cov_post = np.eye(len(feature_cols)) * 1.0
 
@@ -171,11 +176,15 @@ live = {"cot_long": float(cot_long), "cot_short": float(cot_short), "fed_prob": 
 aug = pd.concat([df.head(1).copy(), pd.DataFrame([live])], ignore_index=True)
 live_feat = build_features(aug, s_cot_local=s_cot).iloc[-1]
 x_live = live_feat[feature_cols].fillna(0).values
-net = live_feat["net"]
+net = float(live_feat["net"])
 
 # Posterior sampling + predicción (defensiva)
 try:
-    samples = np.random.multivariate_normal(beta_map, cov_post, size=4000)
+    # ensure cov_post is symmetric PSD (small jitter)
+    cov_post = np.array(cov_post)
+    cov_post = 0.5 * (cov_post + cov_post.T)
+    jitter = 1e-8 * np.eye(cov_post.shape[0])
+    samples = np.random.multivariate_normal(beta_map, cov_post + jitter, size=4000)
     sample_probs = sigmoid(samples.dot(x_live))
     p_mean = float(sample_probs.mean())
     p_low = float(np.percentile(sample_probs, 2.5))
@@ -216,4 +225,149 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
     Devuelve (texto_simple, texto_tecnico).
     """
     # Frases simples y directas
-    prob_text = f"P({par}
+    prob_text = f"P({par} ↑) ≈ {p_mean*100:.1f}% (IC95%: {p_low*100:.1f}%–{p_high*100:.1f}%). Convicción: {conviction}/100."
+    if decision_flag == "buy":
+        simple = (
+            "Recomendación: **Comprar / Abrir posición larga (táctica)**.\n\n"
+            "Por qué (simple): la probabilidad de subida es alta y hay soporte estructural. "
+            "Se sugiere entrar de forma gradual y controlar el riesgo con stops."
+        )
+    elif decision_flag == "sell":
+        simple = (
+            "Recomendación: **Vender / Abrir posición corta (táctica)**.\n\n"
+            "Por qué (simple): la probabilidad favorece la baja y la convicción es suficiente para una operación táctica. "
+            "Usa stops ajustados y tamaño reducido."
+        )
+    else:
+        simple = (
+            "Recomendación: **No operar (esperar)**.\n\n"
+            "Por qué (simple): la probabilidad está cerca de equilibrio y la incertidumbre es elevada; mejor esperar confirmación."
+        )
+
+    # Construimos el texto técnico (audit-friendly) — compacto
+    fed_s = x_live[3]
+    cot_s = x_live[0]
+    retail_s = x_live[4]
+
+    tech_lines = []
+    tech_lines.append(f"Resumen técnico — activo: {par}")
+    tech_lines.append(f"- Probabilidad bayesiana P({par} ↑) = {p_mean*100:.1f}% (IC95%: {p_low*100:.1f}%–{p_high*100:.1f}%). Convicción: {conviction}/100.")
+    # Macro
+    if fed_s > 0.4:
+        tech_lines.append("- Macro: FedWatch con sesgo hawkish → favorece USD fuerte en el corto plazo.")
+    elif fed_s < -0.4:
+        tech_lines.append("- Macro: FedWatch dovish → presión a la baja para USD.")
+    else:
+        tech_lines.append("- Macro: FedWatch neutral/moderado → macro no es el driver dominante ahora.")
+    # COT
+    if abs(cot_s) < 0.15:
+        tech_lines.append("- Posicionamiento (COT): cercano a neutral — riesgo de sobreacumulación limitado.")
+    elif cot_s >= 0.15:
+        tech_lines.append("- Posicionamiento (COT): sesgo long entre no-commercials — soporte estructural pero atención a toma de ganancias.")
+    else:
+        tech_lines.append("- Posicionamiento (COT): sesgo short — riesgo de short-squeeze si macro gira hawkish.")
+    # Retail
+    if retail_s > 0.15:
+        tech_lines.append("- Retail: minoristas inclinados a comprar — posible señal contraria a corto plazo.")
+    elif retail_s < -0.15:
+        tech_lines.append("- Retail: minoristas inclinados a vender — puede reforzar momentum bajista si lo institucional confirma.")
+    else:
+        tech_lines.append("- Retail: posicionamiento minorista balanceado — no prevalece contrarian ahora.")
+    # Contribuciones (compactas)
+    tech_lines.append("- Descomposición de contribuciones (valores y % firmadas):")
+    for name, pct, val in zip(feature_cols, contrib_pct, x_live):
+        sign = "+" if pct >= 0 else "-"
+        tech_lines.append(f"  • {name}: {sign}{abs(pct):.1f}%  (valor {val:.3f})")
+    # Razonamiento y ejecución
+    if decision_flag == "buy":
+        tech_lines.append("- Recomendación táctica: acumulación gradual LONG. Ejecución: scale-in 3 tramos; tamaño inicial 0.5–1% notional; stop 1.0–1.5×ATR; R:R ≥ 1:1.5.")
+    elif decision_flag == "sell":
+        tech_lines.append("- Recomendación táctica: considerar SHORT táctico o reducir largos. Ejecución: tamaño reducido; stops ajustados; vigilar noticias.")
+    else:
+        tech_lines.append("- Recomendación táctica: no operar. Esperar confirmación de flujos o ruptura técnica.")
+    tech_lines.append("- Nota: COT es semanal (retardo); combine con order-flow intradía y skew de opciones para ejecución.")
+
+    texto_tecnico = "\n".join(tech_lines)
+    texto_simple = prob_text + "\n\n" + simple
+    return texto_simple, texto_tecnico
+
+# Obtener textos simple y técnico
+texto_simple, texto_tecnico = narrative_tactical_simplificada(
+    p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par
+)
+
+# ------------------ Interfaz: resultado y narrativa ------------------
+left, right = st.columns([2,3])
+with left:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown(f"<div class='decision'>{decision}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='muted'>Probabilidad (media): <strong>{p_mean*100:.1f}%</strong> &nbsp;&nbsp; 95% IC: <strong>{p_low*100:.1f}%–{p_high*100:.1f}%</strong></div>",
+        unsafe_allow_html=True
+    )
+    st.markdown(f"<div class='muted'>Convicción: <strong>{conviction}/100</strong></div>", unsafe_allow_html=True)
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("### Plan táctico (resumen)", unsafe_allow_html=True)
+    if decision_flag == "buy":
+        st.markdown("- Escala en 3 tramos. Tramo inicial 0.5–1% notional.", unsafe_allow_html=True)
+        st.markdown("- Stop: 1.0–1.5×ATR o por debajo de soporte técnico.", unsafe_allow_html=True)
+        st.markdown("- Target: R:R ≥ 1:1.5.", unsafe_allow_html=True)
+    elif decision_flag == "sell":
+        st.markdown("- Reducir exposiciones largas o iniciar cortos pequeños (0.5–1%).", unsafe_allow_html=True)
+        st.markdown("- Stops estrictos; vigila comunicados macro.", unsafe_allow_html=True)
+    else:
+        st.markdown("- No operar. Esperar señal clara o confirmación de flujos.", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with right:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=p_mean*100,
+        number={'suffix': '%'},
+        domain={'x': [0,1], 'y': [0,1]},
+        title={'text': f"P({par} ↑)"},
+        gauge={
+            'axis': {'range': [0,100]},
+            'bar': {'color': "#0f2742"},
+            'steps': [
+                {'range':[0,40], 'color':'#d9534f'},
+                {'range':[40,60], 'color':'#f0ad4e'},
+                {'range':[60,100], 'color':'#2a9d8f'}
+            ],
+        }
+    ))
+    st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("### Resumen contextual — versión simple", unsafe_allow_html=True)
+st.markdown(f"<div class='card'><div class='explain'>{texto_simple.replace(chr(10), '<br/>')}</div></div>", unsafe_allow_html=True)
+
+with st.expander("Ver explicación técnica (detalle para analistas)"):
+    st.markdown(f"<div class='card'><div class='explain'>{texto_tecnico.replace(chr(10), '<br/>')}</div></div>", unsafe_allow_html=True)
+
+# ------------------ Tabla de componentes y coeficientes ------------------
+st.markdown("### Componentes (valores normalizados) y coeficientes MAP")
+comp_df = pd.DataFrame({
+    "Componente": feature_cols,
+    "Valor (normalizado)": [f"{v:.4f}" for v in x_live],
+    "beta_MAP": [f"{float(b):.4f}" for b in beta_map],
+    "Contribución firmada (%)": [f"{float(c):.1f}%" for c in contrib_pct]
+})
+st.table(comp_df)
+
+# ------------------ Exportar resultado ------------------
+out_df = pd.DataFrame([{
+    "par": par, "cot_long": cot_long, "cot_short": cot_short, "net": net,
+    "fed_prob": fed_prob, "retail_pct": retail_pct,
+    "p_mean": p_mean, "p_2.5": p_low, "p_97.5": p_high,
+    "conviction": conviction, "decision": decision
+}])
+
+try:
+    excel_bytes = to_excel_bytes(out_df)
+    st.download_button("Exportar resultado (Excel)", data=excel_bytes, file_name=f"kennis_{par.replace('/','')}_signal.xlsx")
+except Exception as e:
+    st.error("Error exportando Excel: " + str(e))
+
+st.markdown("---")
+st.markdown("<div class='small'>Implementación: Logistic bayesiano táctico (MAP + Laplace). Suba CSV con 'target_up' para calibración real y backtests. Uso profesional: combine con price feed y motor de ejecución.</div>", unsafe_allow_html=True)
+st.markdown("© Kennis FX Markets — Institutional Bayesian Intelligence Engine", unsafe_allow_html=True)
