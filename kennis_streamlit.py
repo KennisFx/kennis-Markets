@@ -216,4 +216,4 @@ def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_
     Devuelve (texto_simple, texto_tecnico).
     """
     # Frases simples y directas
-    prob_text = f"P({par}_
+    prob_text = f"P({par}
