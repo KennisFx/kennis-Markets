@@ -40,7 +40,18 @@ st.sidebar.header("Entradas (táctica / swing)")
 uploaded = st.sidebar.file_uploader("Sube CSV histórico (opcional). Columnas requeridas: date,cot_long,cot_short,fed_prob,retail_pct,target_up", type=["csv"])
 st.sidebar.markdown("O ingresa la fila live abajo:")
 
-par = st.sidebar.selectbox("Par de divisas", ["USD/JPY", "EUR/USD", "GBP/USD", "AUD/USD", "USD/CHF"], index=0)
+par = st.sidebar.selectbox(
+    "Par de divisas",
+    [
+        # Majors
+        "USD/JPY", "EUR/USD", "GBP/USD", "AUD/USD", "USD/CHF", "USD/CAD", "NZD/USD",
+        "EUR/GBP", "EUR/JPY", "GBP/JPY",
+        # Principales exóticas / emergentes y crosses relevantes
+        "USD/SGD", "USD/MXN", "USD/BRL", "USD/ZAR", "USD/TRY", "USD/HKD", "EUR/TRY", "GBP/TRY"
+    ],
+    index=0
+)
+
 cot_long = st.sidebar.number_input("COT No-Commercial — Long", value=13662, step=1)
 cot_short = st.sidebar.number_input("COT No-Commercial — Short", value=13546, step=1)
 fed_prob = st.sidebar.number_input("FedWatch Prob (%) para bin actual", min_value=0.0, max_value=100.0, value=96.0, step=0.1)
@@ -198,115 +209,11 @@ if np.sum(np.abs(contrib_raw)) > 0:
 else:
     contrib_pct = np.zeros_like(contrib_raw)
 
-# ------------------ Narrativa experta (en español) ------------------
-def narrative_tactical(p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par):
-    lines = []
-    lines.append(f"Resumen ejecutivo (táctico) — activo: {par}")
-    lines.append(f"- Probabilidad bayesiana P({par} ↑) = {p_mean*100:.1f}% (IC95%: {p_low*100:.1f}%–{p_high*100:.1f}%). Convicción: {conviction}/100.")
-    fed_s = x_live[3]
-    cot_s = x_live[0]
-    retail_s = x_live[4]
-    if fed_s > 0.4:
-        lines.append("- Macro: FedWatch muestra sesgo hawkish — esto favorece fuerza del USD frente al JPY en el horizonte táctico.")
-    elif fed_s < -0.4:
-        lines.append("- Macro: FedWatch muestra sesgo dovish — presión a la baja sobre USD esperable.")
-    else:
-        lines.append("- Macro: FedWatch neutral/moderado — macro por sí sola no domina la señal táctica.")
-    if abs(cot_s) < 0.15:
-        lines.append("- Posicionamiento: COT de no-commercials cerca de neutral; riesgo de cola limitado por sobreposicionamiento.")
-    elif cot_s >= 0.15:
-        lines.append("- Posicionamiento: COT exhibe sesgo long entre no-commercials — soporte estructural, pero cuidado con toma de ganancias.")
-    else:
-        lines.append("- Posicionamiento: COT exhibe sesgo short — riesgo de short-squeeze si macro gira hawkish.")
-    if retail_s > 0.15:
-        lines.append("- Retail: minoristas inclinados a comprar — aviso contrarian en plazos cortos; prudencia en entradas agresivas.")
-    elif retail_s < -0.15:
-        lines.append("- Retail: minoristas inclinados a vender — puede reforzar momentum si flujo institucional coincide.")
-    else:
-        lines.append("- Retail: posicionamiento minorista balanceado — señal contraria no relevante ahora.")
-    lines.append("- Descomposición de señales (contribución firmada en %):")
-    for name, pct, val in zip(feature_cols, contrib_pct, x_live):
-        sign = "+" if pct >= 0 else "-"
-        lines.append(f"  • {name}: {sign}{abs(pct):.1f}% (valor {val:.3f})")
-    if decision_flag == "buy":
-        lines.append("- Recomendación táctica: Acumulación gradual LONG. Razón: P posterior y convicción respaldan sesgo alcista táctico.")
-        lines.append("- Ejecución sugerida: escala en 3 tramos; tamaño inicial 0.5–1% notional; stop técnico 1.0–1.5×ATR; objetivo R:R ≥ 1:1.5.")
-    elif decision_flag == "sell":
-        lines.append("- Recomendación táctica: Considerar SHORT táctico o reducción de posiciones largas. Razón: posterior favorece la baja con convicción.")
-        lines.append("- Ejecución sugerida: tamaño reducido; stops ajustados; vigilar noticias macro.")
-    else:
-        lines.append("- Recomendación táctica: No operar. Razón: incertidumbre relevante; esperar confirmación de flujo o ruptura macro.")
-    lines.append("- Nota: COT es semanal (retardo); combinar con order flow intradía y skew de opciones para ejecución.")
-    return "\n".join(lines)
-
-narrative = narrative_tactical(p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par)
-
-# ------------------ Interfaz: resultado y narrativa ------------------
-left, right = st.columns([2,3])
-with left:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown(f"<div class='decision'>{decision}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='muted'>Probabilidad (media): <strong>{p_mean*100:.1f}%</strong> &nbsp;&nbsp; 95% IC: <strong>{p_low*100:.1f}%–{p_high*100:.1f}%</strong></div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='muted'>Convicción: <strong>{conviction}/100</strong></div>", unsafe_allow_html=True)
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("### Plan táctico (resumen)", unsafe_allow_html=True)
-    if decision_flag == "buy":
-        st.markdown("- Escala en 3 tramos. Tramo inicial 0.5–1% notional.", unsafe_allow_html=True)
-        st.markdown("- Stop: 1.0–1.5×ATR o por debajo de soporte técnico.", unsafe_allow_html=True)
-        st.markdown("- Target: R:R ≥ 1:1.5.", unsafe_allow_html=True)
-    elif decision_flag == "sell":
-        st.markdown("- Reducir exposiciones largas o iniciar cortos pequeños (0.5–1%).", unsafe_allow_html=True)
-        st.markdown("- Stops estrictos; vigila comunicados macro.", unsafe_allow_html=True)
-    else:
-        st.markdown("- No operar. Esperar señal clara o confirmación de flujos.", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with right:
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=p_mean*100,
-        number={'suffix': '%'},
-        domain={'x': [0,1], 'y': [0,1]},
-        title={'text': f"P({par} ↑)"},
-        gauge={
-            'axis': {'range': [0,100]},
-            'bar': {'color': "#0f2742"},
-            'steps': [
-                {'range':[0,40], 'color':'#d9534f'},
-                {'range':[40,60], 'color':'#f0ad4e'},
-                {'range':[60,100], 'color':'#2a9d8f'}
-            ],
-        }
-    ))
-    st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("### Narrativa contextual — experto", unsafe_allow_html=True)
-st.markdown(f"<div class='card'><div class='explain'>{narrative.replace(chr(10), '<br/>')}</div></div>", unsafe_allow_html=True)
-
-# ------------------ Tabla de componentes y coeficientes ------------------
-st.markdown("### Componentes (valores normalizados) y coeficientes MAP")
-comp_df = pd.DataFrame({
-    "Componente": feature_cols,
-    "Valor (normalizado)": [f"{v:.4f}" for v in x_live],
-    "beta_MAP": [float(b) for b in beta_map],
-    "Contribución firmada (%)": [f"{float(c):.1f}%" for c in contrib_pct]
-})
-st.table(comp_df)
-
-# ------------------ Exportar resultado ------------------
-out_df = pd.DataFrame([{
-    "par": par, "cot_long": cot_long, "cot_short": cot_short, "net": net,
-    "fed_prob": fed_prob, "retail_pct": retail_pct,
-    "p_mean": p_mean, "p_2.5": p_low, "p_97.5": p_high,
-    "conviction": conviction, "decision": decision
-}])
-
-try:
-    excel_bytes = to_excel_bytes(out_df)
-    st.download_button("Exportar resultado (Excel)", data=excel_bytes, file_name=f"kennis_{par.replace('/','')}_signal.xlsx")
-except Exception as e:
-    st.error("Error exportando Excel: " + str(e))
-
-st.markdown("---")
-st.markdown("<div class='small'>Implementación: Logistic bayesiano táctico (MAP + Laplace). Suba CSV con 'target_up' para calibración real y backtests. Uso profesional: combine con price feed y motor de ejecución.</div>", unsafe_allow_html=True)
-st.markdown("© Kennis FX Markets — Institutional Bayesian Intelligence Engine", unsafe_allow_html=True)
+# ------------------ Narrativa simplificada + técnica (en español) ------------------
+def narrative_tactical_simplificada(p_mean, p_low, p_high, conviction, decision_flag, x_live, contrib_pct, feature_cols, par):
+    """
+    Versión legible para usuario promedio + explicación técnica desplegable.
+    Devuelve (texto_simple, texto_tecnico).
+    """
+    # Frases simples y directas
+    prob_text = f"P({par}_
